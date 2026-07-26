@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# 输出
+xhs_output/
+*.json.tmp
+
+# 飞书凭证
+cookies.json
+*.session
+*_meta.json
+
+# 系统文件
+.DS_Store
+Thumbs.db
