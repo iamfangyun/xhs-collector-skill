@@ -85,14 +85,28 @@ python scripts/sync_to_lark.py \
 xhs-collector-skill/
 ├── SKILL.md                       # Skill 主入口（WorkBuddy 读取）
 ├── README.md                      # 本文件
+├── AUTOMATION.md                  # 定时任务配置文档
 ├── scripts/
 │   ├── collect.py                 # 主采集脚本
-│   └── sync_to_lark.py            # 飞书同步脚本
+│   ├── sync_to_lark.py            # 飞书同步脚本
+│   └── scheduler.py               # 每日定时调度脚本（automation 用）
 └── references/
     ├── xhs_mcp_reference.md       # xiaohongshu-mcp 完整工具文档
     ├── lark_schema.md             # 飞书多维表格 schema
     └── risk_control.md            # 风控规则总览
 ```
+
+## 定时任务（Automation）
+
+支持每天凌晨自动采集昨天所有账号的笔记，配置见 [`AUTOMATION.md`](AUTOMATION.md)。
+
+核心特性：
+- 每天凌晨 5:00 触发
+- 启动后随机 sleep 1~10 分钟（模拟人类作息）
+- 自动扫描飞书账号表所有 redId
+- 账号间隔随机 5~8 分钟
+- 遇错即停（失败原因写到飞书「采集日志」表）
+- 飞书日志表记录每次任务执行情况
 
 ## 已知限制
 
