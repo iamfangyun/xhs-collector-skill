@@ -1,329 +1,409 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-xhs-collector · 主采集脚本
+xhs-collector · 主采集脚本 (v2 - 适配 xiaohongshu-mcp v2.0.0+)
 
 用法:
-    python collect.py --red-id 95466594071 --date 2026-07-22 [--out ./out]
+    python collect.py --profile-url "https://www.xiaohongshu.com/user/profile/XXXX?xsec_token=YYYY" --date 2026-07-26 [--out ./out]
 
-输入:
-    --red-id   小红书账号的 redId（8-11 位数字，主页 URL 里的"小红书号"）
-    --date     想采集的日期，格式 YYYY-MM-DD（北京时间）
-    --out      输出目录（默认: ./xhs_output）
-
-依赖:
-    - xiaohongshu-mcp 已启动并监听 http://localhost:18060/mcp
-    - cookies.json 已登录某个小红书账号
+关键变化 (v1 → v2):
+    - 输入参数: --red-id → --profile-url（完整主页URL，必须带 xsec_token）
+    - 原因: xiaohongshu-mcp v2.0.0 的 user_profile 强制要求 user_id(24位hex) + xsec_token
+            redId(8-11位数字) 既不是 user_id 也无法换取 xsec_token，因此废弃 redId 作为输入
+    - MCP 调用必须带 Accept: application/json, text/event-stream 头
+    - user_profile 返回结构: userBasicInfo / interactions / feeds (不再是 basic_info/notes)
+    - get_feed_detail 参数: feed_id (不再是 note_id)
+    - feeds 列表里没有时间字段，必须逐篇拉详情才能按天过滤
 
 输出:
-    <out>/<redId>_<date>/<redId>_<date>.json  - 采集结果（账号+笔记+评论+图片路径）
+    <out>/<redId>_<nickname>/<redId>_<nickname>_<date>.json
+    <out>/<redId>_<nickname>/images/<note_id>_<idx>.webp
 
 风控规则:
-    - 任何 MCP 调用之间 ≥1 秒间隔（小红书硬性要求）
-    - 笔记之间 ≥30 秒间隔（避免短时间高频访问同一账号内容）
-    - 任何响应出现"风控"字样或异常 status，立即停止并写错误日志
+    - 任意两次 MCP 调用之间 ≥1.5 秒
+    - 命中笔记之间 ≥30 秒
+    - 风控关键词命中立即停止: 风控/异常/blocked/forbidden/请稍后再试/verify/登录已过期
 """
 import argparse
+import datetime
 import json
 import os
-import subprocess
+import re
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 MCP_URL = "http://localhost:18060/mcp"
-SESSION_ID_FILE = Path(os.environ.get("TEMP", "/tmp")) / "xhs_collector_session.txt"
-PACING_API_SEC = 1.0       # 任意两次 MCP API 调用间隔
-PACING_NOTE_SEC = 30.0     # 笔记之间间隔
-RISK_KEYWORDS = ["风控", "异常", "blocked", "forbidden", "请稍后再试", "verify"]
+PACING_API_SEC = 1.5        # 任意两次 MCP API 调用间隔
+PACING_NOTE_SEC = 30.0      # 命中笔记之间间隔
+PACING_BATCH_SEC = 15.0     # 每拉取 10 篇详情小休一次
+RISK_KEYWORDS = ["风控", "异常", "blocked", "forbidden", "请稍后再试",
+                 "verify", "登录已过期", "login", "访问被拒绝"]
+
+BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 
-def http_post_json(url, payload, headers=None, timeout=30):
-    """发送 POST application/json，返回解析后的 JSON。"""
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    h = {"Content-Type": "application/json",
-         "Accept": "application/json, text/event-stream"}
+def log(msg):
+    ts = datetime.datetime.now(BEIJING_TZ).strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+# ============== MCP 调用 ==============
+
+def mcp_post(payload, headers=None, timeout=180):
+    """发送 POST，返回 (parsed_body, response_headers)。"""
+    h = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",  # v2.0.0 必须带，否则 400
+    }
     if headers:
         h.update(headers)
-    req = urllib.request.Request(url, data=data, headers=h, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-    return json.loads(body), dict(resp.headers)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(MCP_URL, data=data, headers=h, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8")), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")[:500]
+        raise RuntimeError(f"HTTP {e.code}: {body}")
 
 
-def mcp_initialize():
+def mcp_init():
     """初始化 MCP 会话，返回 session_id。"""
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "xhs-collector", "version": "1.0.0"},
+            "clientInfo": {"name": "xhs-collector", "version": "2.0.0"},
         },
     }
-    resp_body, resp_headers = http_post_json(MCP_URL, payload, timeout=15)
-    # session-id 可能在不同大小写
+    body, headers = mcp_post(payload, timeout=15)
     sid = None
-    for k, v in resp_headers.items():
+    for k, v in headers.items():
         if k.lower() == "mcp-session-id":
             sid = v
             break
     if not sid:
-        raise RuntimeError(f"未拿到 Mcp-Session-Id, headers={resp_headers}")
+        raise RuntimeError(f"未拿到 Mcp-Session-Id, headers={headers}")
     # 发送 initialized 通知
     time.sleep(PACING_API_SEC)
-    notif = {"jsonrpc": "2.0", "method": "notifications/initialized"}
     try:
-        http_post_json(MCP_URL, notif, headers={"Mcp-Session-Id": sid}, timeout=10)
+        mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"},
+                 headers={"Mcp-Session-Id": sid}, timeout=10)
     except Exception:
         pass  # 通知允许失败
     return sid
 
 
-def mcp_call(sid, tool_name, arguments, timeout=60):
-    """调用 MCP 工具，返回 result.content[0].text 解析后的对象。"""
+def check_risk(text):
+    """风控关键词检测，命中则抛 RuntimeError。"""
+    lower = text.lower()
+    for kw in RISK_KEYWORDS:
+        if kw in lower or kw in text:
+            raise RuntimeError(f"⚠️ 风控关键词命中: '{kw}' — 立即停止")
+
+
+def mcp_call(sid, tool_name, arguments, timeout=180):
+    """调用 MCP 工具，返回解析后的对象。"""
     payload = {
         "jsonrpc": "2.0", "id": 2,
         "method": "tools/call",
         "params": {"name": tool_name, "arguments": arguments},
     }
-    resp, _ = http_post_json(MCP_URL, payload,
-                             headers={"Mcp-Session-Id": sid}, timeout=timeout)
-    # 风控检测
-    raw = json.dumps(resp, ensure_ascii=False)
-    for kw in RISK_KEYWORDS:
-        if kw in raw:
-            raise RuntimeError(f"⚠️ 风控信号 '{kw}' 出现在响应中，立即停止！raw={raw[:300]}")
+    resp, _ = mcp_post(payload, headers={"Mcp-Session-Id": sid}, timeout=timeout)
     if "error" in resp:
         raise RuntimeError(f"MCP error: {resp['error']}")
     text = resp["result"]["content"][0]["text"]
-    return json.loads(text)
-
-
-def parse_account_and_notes(profile_resp):
-    """从 user_profile 响应里提取账号信息和笔记列表。"""
-    # 响应结构因版本而异，做容错
-    data = profile_resp.get("data", profile_resp)
-    user = data.get("user", data.get("userInfo", {}))
-    interactions = data.get("interactions", data.get("interaction", {}))
-    notes = data.get("notes", data.get("feeds", []))
-    account = {
-        "redId": str(user.get("redId", user.get("red_id", ""))),
-        "user_id": user.get("userId", user.get("user_id", "")),
-        "nickname": user.get("nickname", ""),
-        "desc": user.get("desc", ""),
-        "ip_location": user.get("ipLocation", user.get("ip_location", "")),
-        "avatar": user.get("avatar", user.get("image", "")),
-        "interactions": {
-            "follows": interactions.get("follows", interactions.get("followCount", 0)),
-            "fans": interactions.get("fans", interactions.get("fansCount", 0)),
-            "interaction": interactions.get("interaction", interactions.get("interactionCount", 0)),
-        },
-    }
-    return account, notes
-
-
-def filter_notes_by_date(notes, date_str, tz_offset_hours=8):
-    """按北京时间筛选笔记（time 字段是毫秒时间戳）。"""
-    target_date = time.strptime(date_str, "%Y-%m-%d")
-    target_yday = target_date.tm_yday
-    target_year = target_date.tm_year
-    matched = []
-    for n in notes:
-        ts_ms = n.get("time", n.get("createTime", 0))
-        if not ts_ms:
-            continue
-        # 转北京时间
-        ts_sec = ts_ms / 1000 + tz_offset_hours * 3600
-        tm = time.gmtime(ts_sec)
-        if tm.tm_year == target_year and tm.tm_yday == target_yday:
-            matched.append(n)
-    return matched
-
-
-def download_image(url, save_path, referer="https://www.xiaohongshu.com/"):
-    """下载图片到本地。"""
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": referer,
-    })
+    check_risk(text)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"_raw_text": text}
+
+
+# ============== URL 解析 ==============
+
+def parse_profile_url(url):
+    """
+    从主页 URL 提取 user_id 和 xsec_token。
+    URL 格式: https://www.xiaohongshu.com/user/profile/{user_id}?xsec_token=...&...
+    user_id 是 24 位 hex。
+    """
+    parsed = urllib.parse.urlparse(url)
+    # path: /user/profile/64632e46000000001002b7c5
+    m = re.match(r"^/user/profile/([a-f0-9]{24})$", parsed.path)
+    if not m:
+        raise RuntimeError(f"URL 路径无法解析 user_id: {parsed.path}（需要 24 位 hex）")
+    user_id = m.group(1)
+
+    # query 里的 xsec_token（注意可能 URL 编码过）
+    qs = urllib.parse.parse_qs(parsed.query)
+    xsec_token = qs.get("xsec_token", [""])[0]
+    if not xsec_token:
+        raise RuntimeError(f"URL 里没有 xsec_token 参数: {url}")
+    # URL 解码（%3D → =）
+    xsec_token = urllib.parse.unquote(xsec_token)
+    return user_id, xsec_token
+
+
+# ============== 业务逻辑 ==============
+
+def fetch_profile(sid, user_id, xsec_token):
+    """调用 user_profile 拿账号信息和笔记列表 (v2.0.0 新 schema)。"""
+    data = mcp_call(sid, "user_profile", {
+        "user_id": user_id,
+        "xsec_token": xsec_token,
+    })
+
+    info = data.get("userBasicInfo", {})
+    interactions_list = data.get("interactions", [])
+    feeds = data.get("feeds", [])
+
+    # interactions 是数组: [{type:'follows',count:'3'}, ...]
+    interactions = {}
+    for it in interactions_list:
+        t = it.get("type", "")
+        c = it.get("count", "0")
+        try:
+            interactions[t] = int(c)
+        except (ValueError, TypeError):
+            interactions[t] = 0
+
+    account = {
+        "redId": str(info.get("redId", "")),
+        "user_id": user_id,
+        "nickname": info.get("nickname", ""),
+        "desc": info.get("desc", "") or "",
+        "ip_location": info.get("ipLocation", "") or "",
+        "avatar": info.get("imageb") or info.get("images", "") or "",
+        "interactions": {
+            "follows": interactions.get("follows", 0),
+            "fans": interactions.get("fans", 0),
+            "interaction": interactions.get("interaction", 0),
+        },
+        # 保留原始 URL 供飞书表存储
+        "profile_url_with_token": f"https://www.xiaohongshu.com/user/profile/{user_id}?xsec_token={urllib.parse.quote(xsec_token, safe='')}",
+    }
+    return account, feeds
+
+
+def fetch_detail(sid, feed_id, xsec_token):
+    """调用 get_feed_detail 拿笔记详情 + 评论 (v2.0.0 新 schema, 参数名是 feed_id)。"""
+    return mcp_call(sid, "get_feed_detail", {
+        "feed_id": feed_id,
+        "xsec_token": xsec_token,
+        # 不主动加载全部评论，只取首页 10 条，避免触发风控
+        "load_all_comments": False,
+    })
+
+
+def in_date_range(ts_ms, target_date_str):
+    """毫秒时间戳(北京时间)是否落在 target_date_str (YYYY-MM-DD) 当天。"""
+    if not ts_ms:
+        return False, None
+    dt = datetime.datetime.fromtimestamp(ts_ms / 1000, BEIJING_TZ)
+    return dt.strftime("%Y-%m-%d") == target_date_str, dt
+
+
+def download_image(url, save_path):
+    """下载图片到本地。"""
+    if not url or not url.startswith("http"):
+        return False
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    if save_path.exists():
+        return True
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.xiaohongshu.com/",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
             save_path.write_bytes(resp.read())
-        return True, save_path.stat().st_size
+        return True
     except Exception as e:
-        return False, str(e)
+        log(f"    图片下载失败 {url[:60]}: {e}")
+        return False
+
+
+def safe_filename(name):
+    """生成文件名安全的字符串。"""
+    return re.sub(r'[\\/:*?"<>|]', "_", name)[:50]
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--red-id", required=True, help="小红书 redId (8-11 位数字)")
-    ap.add_argument("--date", required=True, help="日期 YYYY-MM-DD（北京时间）")
-    ap.add_argument("--out", default="./xhs_output", help="输出目录")
+    ap = argparse.ArgumentParser(description="xhs-collector v2 - 采集指定账号指定日期的笔记")
+    ap.add_argument("--profile-url", required=True,
+                    help="小红书主页完整 URL（必须带 xsec_token 参数）")
+    ap.add_argument("--date", required=True,
+                    help="目标日期 YYYY-MM-DD（北京时间）")
+    ap.add_argument("--out", default="./xhs_output",
+                    help="输出根目录（默认 ./xhs_output）")
     args = ap.parse_args()
 
-    out_root = Path(args.out).absolute()
-    out_dir = out_root / f"{args.red_id}_{args.date}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[1/6] 初始化 MCP 会话...")
-    sid = mcp_initialize()
-    print(f"      session_id = {sid}")
-
-    print(f"[2/6] 检查登录状态...")
-    time.sleep(PACING_API_SEC)
-    login = mcp_call(sid, "check_login_status", {})
-    login_text = json.dumps(login, ensure_ascii=False)
-    if "已登录" not in login_text:
-        print(f"ERROR: 未登录，请先用 xiaohongshu-login-windows-amd64.exe 扫码")
+    # 1. 解析 URL
+    try:
+        user_id, xsec_token = parse_profile_url(args.profile_url)
+    except RuntimeError as e:
+        log(f"❌ URL 解析失败: {e}")
+        log(f"   需要的格式: https://www.xiaohongshu.com/user/profile/<24位hex>?xsec_token=...")
         sys.exit(1)
-    print(f"      {login_text[:120]}")
 
-    # user_profile 需要 user_id + xsec_token，但 redId 不是 user_id
-    # 通过 list_feeds + 搜索 redId 间接获取 user_id/xsec_token 的能力 xiaohongshu-mcp 不支持
-    # 实际方案：直接传 redId 作为 user_id 调用（部分版本兼容），如果失败需要用户提供 user_id
-    print(f"[3/6] 拉取账号 {args.red_id} 主页...")
+    log("=" * 60)
+    log(f"开始采集 user_id={user_id}, date={args.date}")
+    log("=" * 60)
+
+    # 2. MCP 初始化 + 登录检查
+    log("[1/5] 初始化 MCP 会话...")
+    sid = mcp_init()
+    log(f"      session_id = {sid}")
+
+    log("[2/5] 检查登录状态...")
+    time.sleep(PACING_API_SEC)
+    login = mcp_call(sid, "check_login_status", {}, timeout=180)
+    login_text = json.dumps(login, ensure_ascii=False)
+    if "已登录" not in login_text and "true" not in login_text.lower():
+        log(f"❌ 未登录，请先用 xiaohongshu-login-windows-amd64.exe 扫码")
+        sys.exit(1)
+    log("      登录正常")
+
+    # 3. 拉账号主页 + feeds 列表
+    log(f"[3/5] 拉取账号主页...")
     time.sleep(PACING_API_SEC)
     try:
-        profile_resp = mcp_call(sid, "user_profile", {
-            "user_id": args.red_id,  # redId 兼容
-            "xsec_token": "",  # 部分 MCP 版本可空
-        }, timeout=60)
+        account, feeds = fetch_profile(sid, user_id, xsec_token)
     except RuntimeError as e:
-        print(f"      user_profile 失败: {e}")
-        print(f"      提示: redId 兼容性问题，请改用 user_id（24位hex）")
+        err = str(e)
+        log(f"❌ user_profile 失败: {err}")
+        if "xsec_token" in err or "token" in err.lower():
+            log(f"   提示: xsec_token 可能已失效，请到小红书网页端打开该账号主页，复制浏览器地址栏的完整 URL 重新提供")
         sys.exit(2)
 
-    account, all_notes = parse_account_and_notes(profile_resp)
-    if not account["user_id"]:
-        print(f"ERROR: 未拿到 user_id, profile_resp={json.dumps(profile_resp, ensure_ascii=False)[:300]}")
-        sys.exit(3)
-    print(f"      账号: {account['nickname']} (redId={account['redId']}, 粉丝={account['interactions']['fans']})")
-    print(f"      主页笔记总数: {len(all_notes)}")
+    red_id = account["redId"]
+    nickname = account["nickname"]
+    log(f"      账号: {nickname} (redId={red_id}, 粉丝={account['interactions']['fans']})")
+    log(f"      主页笔记列表数: {len(feeds)}")
 
-    print(f"[4/6] 筛选 {args.date}（北京时间）的笔记...")
-    matched = filter_notes_by_date(all_notes, args.date)
-    print(f"      匹配 {len(matched)} 篇")
-    if not matched:
-        print("      无匹配笔记，输出空结果")
-        result = {"collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                  "target_date": args.date, "account": account, "notes": []}
-        (out_dir / f"{args.red_id}_{args.date}.json").write_text(
-            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        return
+    out_root = Path(args.out).absolute()
+    safe_nick = safe_filename(nickname) or "unknown"
+    out_dir = out_root / f"{red_id}_{safe_nick}"
+    img_dir = out_dir / "images"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[5/6] 采集每篇笔记详情+评论+图片...")
-    enriched_notes = []
-    for i, n in enumerate(matched, 1):
-        note_id = n.get("noteId", n.get("note_id", ""))
-        xsec = n.get("xsecToken", n.get("xsec_token", ""))
-        title = n.get("title", n.get("displayTitle", ""))[:60]
-        print(f"  [{i}/{len(matched)}] {note_id} - {title}")
-        if i > 1:
-            print(f"      等待 {PACING_NOTE_SEC}s（笔记间节流）...")
-            time.sleep(PACING_NOTE_SEC)
-        time.sleep(PACING_API_SEC)
-        detail_args = {
-            "feed_id": note_id, "xsec_token": xsec,
-            "load_all_comments": True, "limit": 20,
-            "click_more_replies": False, "scroll_speed": "slow",
-        }
-        try:
-            detail = mcp_call(sid, "get_feed_detail", detail_args, timeout=90)
-        except RuntimeError as e:
-            print(f"      FAIL: {e}")
-            enriched_notes.append({"note_id": note_id, "_error": str(e)})
+    # 4. 逐篇拉详情，按日期过滤
+    log(f"[4/5] 逐篇拉详情过滤日期 {args.date}（共 {len(feeds)} 篇）...")
+    matched = []
+    for i, f in enumerate(feeds):
+        feed_id = f.get("id")
+        feed_token = f.get("xsecToken")
+        if not feed_id or not feed_token:
+            log(f"  [{i}] 跳过: 缺 id/token")
             continue
 
-        note_data = detail.get("data", {}).get("note", {})
-        comments_data = detail.get("data", {}).get("comments", {})
-        c_list = comments_data.get("list", []) if isinstance(comments_data, dict) else comments_data
+        try:
+            time.sleep(PACING_API_SEC)
+            detail = fetch_detail(sid, feed_id, feed_token)
+            note = detail.get("data", {}).get("note", {})
+            ts_ms = note.get("time")
+            if not ts_ms:
+                log(f"  [{i}] {feed_id} 无 time 字段,跳过")
+                continue
+
+            hit, dt = in_date_range(ts_ms, args.date)
+            title = (note.get("title") or "")[:30]
+            if hit:
+                log(f"  [{i}] ✅ {dt.strftime('%H:%M')} {feed_id} {title}")
+                matched.append({"feed": f, "detail": detail, "dt": dt})
+                # 命中笔记间隔 30s+
+                pause = 30.0 + (i % 5) * 3  # 30~42s
+                log(f"      命中,休眠 {pause:.0f}s")
+                time.sleep(pause)
+            else:
+                log(f"  [{i}] ❌ {dt.strftime('%m-%d %H:%M')} {feed_id} {title}")
+                # 每 10 篇小休
+                if (i + 1) % 10 == 0:
+                    time.sleep(PACING_BATCH_SEC)
+
+        except RuntimeError as e:
+            err = str(e)
+            log(f"  [{i}] ❌ ERROR {feed_id}: {err}")
+            if any(kw in err for kw in RISK_KEYWORDS):
+                log("⚠️⚠️⚠️ 疑似风控,立即终止!")
+                sys.exit(3)
+            time.sleep(5)
+
+    log(f"\n      命中 {len(matched)} 篇")
+
+    if not matched:
+        log("该日期无笔记,输出空结果")
+        result = {
+            "collected_at": datetime.datetime.now(BEIJING_TZ).isoformat(),
+            "target_date": args.date,
+            "account": account,
+            "matched_notes": [],
+        }
+        out_file = out_dir / f"{red_id}_{safe_nick}_{args.date}.json"
+        out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"✅ 输出: {out_file}")
+        return
+
+    # 5. 整理 + 下载图片
+    log("[5/5] 整理结果 + 下载图片...")
+    notes_out = []
+    for m in matched:
+        note = m["detail"].get("data", {}).get("note", {})
+        comments = m["detail"].get("data", {}).get("comments", {})
 
         # 下载图片
-        image_files = []
-        note_dir = out_dir / f"note_{note_id}"
-        for j, img in enumerate(note_data.get("imageList", []), 1):
-            url = img.get("urlDefault") or img.get("url_default") or img.get("url", "")
-            if not url:
-                continue
-            w, h = img.get("width", "?"), img.get("height", "?")
-            img_path = note_dir / f"image_{j:02d}_{w}x{h}.webp"
-            ok, info = download_image(url, img_path)
-            if ok:
-                image_files.append({"path": str(img_path.relative_to(out_root)),
-                                    "width": w, "height": h, "size": info})
-                print(f"      图片 {j}: OK ({info//1024}KB)")
-            else:
-                print(f"      图片 {j}: FAIL {info}")
-            time.sleep(PACING_API_SEC)
+        img_files = []
+        for idx, img in enumerate(note.get("imageList", [])):
+            url = img.get("urlDefault") or img.get("urlPre") or img.get("url")
+            if url:
+                fname = f"{m['feed']['id']}_{idx}.webp"
+                p = download_image(url, img_dir / fname)
+                if p:
+                    img_files.append(fname)
+                time.sleep(0.5)
 
-        # 视频封面也下载
-        video = note_data.get("video") or note_data.get("media", {}).get("video")
-        video_cover_path = None
-        if video:
-            cover_url = video.get("cover", {}).get("url") or video.get("cover_url", "")
-            if cover_url:
-                cover_path = note_dir / "video_cover.jpg"
-                ok, _ = download_image(cover_url, cover_path)
-                if ok:
-                    video_cover_path = str(cover_path.relative_to(out_root))
-
-        enriched = {
-            "note_id": note_id,
-            "xsec_token": xsec,
-            "title": note_data.get("title", ""),
-            "desc": note_data.get("desc", ""),
-            "type": note_data.get("type", "normal"),
-            "time_ms": note_data.get("time", 0),
-            "ip_location": note_data.get("ipLocation", ""),
-            "interact": note_data.get("interactInfo", {}),
-            "images": image_files,
-            "video": {
-                "cover_path": video_cover_path,
-                "cover_url": video.get("cover", {}).get("url", "") if video else "",
-                "streams": [{"format": s.get("format", ""), "url": s.get("url", ""), "size": s.get("size", 0)}
-                            for s in (video.get("streams", []) if video else [])],
-            } if video else None,
+        notes_out.append({
+            "note_id": note.get("noteId"),
+            "xsec_token": m["feed"].get("xsecToken"),
+            "type": note.get("type"),
+            "title": note.get("title", "") or "",
+            "desc": note.get("desc", "") or "",
+            "time_ms": note.get("time"),
+            "time_str": m["dt"].strftime("%Y-%m-%d %H:%M:%S"),
+            "ip_location": note.get("ipLocation", "") or "",
+            "interactions": note.get("interactInfo", {}),
+            "image_files": img_files,
             "comments": {
-                "count": len(c_list),
-                "list": [{
-                    "id": c.get("id", ""),
-                    "content": c.get("content", ""),
-                    "like_count": c.get("likeCount", 0),
-                    "create_time_ms": c.get("createTime", 0),
-                    "ip_location": c.get("ipLocation", ""),
-                    "user_id": (c.get("userInfo") or {}).get("userId", ""),
-                    "user_nickname": (c.get("userInfo") or {}).get("nickname", ""),
-                    "user_avatar": (c.get("userInfo") or {}).get("avatar", ""),
-                    "sub_comment_count": c.get("subCommentCount", 0),
-                    "is_author": "is_author" in (c.get("showTags", []) or []),
-                } for c in c_list],
+                "count": len(comments.get("list", [])),
+                "has_more": comments.get("hasMore", False),
+                "list": comments.get("list", []),
             },
-        }
-        enriched_notes.append(enriched)
+        })
 
-    print(f"[6/6] 输出 JSON 结果...")
     result = {
-        "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "collected_at": datetime.datetime.now(BEIJING_TZ).isoformat(),
         "target_date": args.date,
         "account": account,
-        "notes": enriched_notes,
-        "pacing": {
-            "api_interval_sec": PACING_API_SEC,
-            "note_interval_sec": PACING_NOTE_SEC,
-        },
+        "matched_notes": notes_out,
     }
-    out_file = out_dir / f"{args.red_id}_{args.date}.json"
+    out_file = out_dir / f"{red_id}_{safe_nick}_{args.date}.json"
     out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n✅ 完成: {out_file}")
-    print(f"   账号: {account['nickname']}")
-    print(f"   笔记: {len(enriched_notes)} 篇")
-    total_imgs = sum(len(n.get("images", [])) for n in enriched_notes)
-    total_cmts = sum(n.get("comments", {}).get("count", 0) for n in enriched_notes)
-    print(f"   图片: {total_imgs} 张")
-    print(f"   评论: {total_cmts} 条")
+
+    log("=" * 60)
+    log(f"✅ 采集完成")
+    log(f"   账号: {nickname} (redId={red_id})")
+    log(f"   日期: {args.date}")
+    log(f"   笔记: {len(notes_out)} 篇")
+    log(f"   图片: {sum(len(n['image_files']) for n in notes_out)} 张")
+    log(f"   评论: {sum(n['comments']['count'] for n in notes_out)} 条")
+    log(f"   输出: {out_file}")
+    log("=" * 60)
 
 
 if __name__ == "__main__":
