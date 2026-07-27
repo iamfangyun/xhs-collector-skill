@@ -241,6 +241,162 @@ def safe_filename(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name)[:50]
 
 
+# ============== 带货品类推测 ==============
+# 用户账号"小土豆炒股"主业是金融内容,但其他账号也可能涉及。
+# 规则: 关键词命中即归类, 多重命中用逗号分隔, 全部不命中填"未识别"。
+# 设计原则: 可解释 (每条规则都有明确关键词列表)、保守 (宁漏不错)、如实 (推测不出来就写未识别)。
+PRODUCT_CATEGORIES = [
+    # 金融/投资类 (用户账号主业,优先识别)
+    {
+        "category": "金融理财",
+        "keywords": [
+            "股票", "A股", "港股", "美股", "大盘", "行情", "涨停", "跌停",
+            "基金", "ETF", "债券", "可转债", "理财", "定投",
+            "开户", "券商", "炒股", "选股", "复盘", "技术分析",
+            "期货", "外汇", "黄金", "原油", "大宗商品",
+            "财报", "业绩", "估值", "市盈率", "ROE",
+            "打新", "新股", "北交所", "科创板", "创业板",
+        ],
+    },
+    # 课程/知识��费类
+    {
+        "category": "知识付费",
+        "keywords": [
+            "课程", "训练营", "公开课", "直播课", "专栏",
+            "报名", "学费", "拼课", "团购",
+            "知识星球", "公众号", "小红书号", "粉丝群",
+            "电子书", "PDF", "学习资料",
+        ],
+    },
+    # 数码电器类
+    {
+        "category": "数码电器",
+        "keywords": [
+            "手机", "iPhone", "华为", "小米", "OPPO", "vivo",
+            "耳机", "AirPods", "降噪",
+            "电脑", "笔记本", "MacBook", "iPad", "平板",
+            "键盘", "鼠标", "显示器",
+            "相机", "单反", "微单", "镜头",
+            "充电宝", "充电器", "数据线",
+            "智能手表", "手表",
+        ],
+    },
+    # 美妆个护类
+    {
+        "category": "美妆个护",
+        "keywords": [
+            "口红", "粉底", "散粉", "眼影", "腮红", "高光",
+            "面膜", "精华", "面霜", "乳液", "爽肤水", "卸妆",
+            "香水", "彩妆", "护肤",
+            "洗发水", "护发", "沐浴露", "身体乳",
+            "美甲", "美睫",
+        ],
+    },
+    # 服饰鞋包类
+    {
+        "category": "服饰鞋包",
+        "keywords": [
+            "连衣裙", "卫衣", "T恤", "衬衫", "西装", "外套",
+            "牛仔裤", "阔腿裤", "瑜伽裤", "短裙", "半裙",
+            "羽绒服", "毛衣", "针织",
+            "运动鞋", "高跟鞋", "靴子", "凉鞋", "拖鞋",
+            "包包", "手提包", "双肩包", "钱包",
+            "帽子", "围巾", "墨镜", "饰品",
+        ],
+    },
+    # 食品保健类
+    {
+        "category": "食品保健",
+        "keywords": [
+            "零食", "坚果", "饼干", "巧克力", "糖果", "蛋糕",
+            "茶叶", "咖啡", "奶茶", "果汁",
+            "代餐", "蛋白粉", "麦片", "酸奶",
+            "保健品", "维生素", "胶原蛋白", "益生菌", "鱼油",
+            "减肥", "瘦身", "代糖",
+        ],
+    },
+    # 母婴玩具类
+    {
+        "category": "母婴玩具",
+        "keywords": [
+            "婴儿", "宝宝", "孕妇", "孕期",
+            "奶粉", "纸尿裤", "辅食",
+            "童装", "童鞋", "玩具", "绘本",
+            "早教", "启蒙",
+        ],
+    },
+    # 家居生活类
+    {
+        "category": "家居生活",
+        "keywords": [
+            "家具", "沙发", "床垫", "床", "衣柜", "书桌",
+            "收纳", "整理", "收纳盒", "衣架",
+            "厨房", "锅具", "刀具", "餐具", "杯子",
+            "清洁", "拖把", "吸尘器", "洗碗机",
+            "床上用品", "四件套", "枕头", "被子",
+            "装饰", "摆件", "香薰", "蜡烛",
+        ],
+    },
+    # 运动户外类
+    {
+        "category": "运动户外",
+        "keywords": [
+            "跑步", "健身", "瑜伽", "普拉提",
+            "运动服", "运动鞋", "运动文胸", "紧身裤",
+            "哑铃", "筋膜枪", "健身器材",
+            "露营", "帐篷", "睡袋", "登山",
+            "自行车", "电动车", "平衡车",
+            "游泳", "骑行", "滑雪",
+        ],
+    },
+    # 旅游服务类
+    {
+        "category": "旅游服务",
+        "keywords": [
+            "酒店", "民宿", "机票", "高铁", "门票",
+            "旅游", "旅行", "攻略", "跟团", "自由行",
+            "签证", "出境",
+        ],
+    },
+]
+
+
+def infer_product_category(title, desc, tags_str=""):
+    """
+    根据笔记标题/正文/标签推测带货品类。
+
+    返回 (category_str, evidence_str):
+        category_str: 命中品类名 (逗号分隔), 或 "未识别"
+        evidence_str: 命中的关键词证据 (用于透明度和后续审查)
+    """
+    if not title:
+        title = ""
+    if not desc:
+        desc = ""
+    if not tags_str:
+        tags_str = ""
+    # 合并所有文本作为分析语料
+    text = f"{title} {desc} {tags_str}"
+
+    hits = []
+    evidence = []
+    for cat in PRODUCT_CATEGORIES:
+        cat_name = cat["category"]
+        matched_kws = []
+        for kw in cat["keywords"]:
+            if kw in text:
+                matched_kws.append(kw)
+        if matched_kws:
+            hits.append(cat_name)
+            # 只记录前 3 个命中关键词避免太长
+            evidence.append(f"{cat_name}({','.join(matched_kws[:3])})")
+
+    if not hits:
+        return "未识别", ""
+
+    return ", ".join(hits), "; ".join(evidence)
+
+
 def refresh_token_via_cdp(red_id, refresh_script=None):
     """
     用 CDP+Edge 自���刷新 redId 的 xsec_token, 返回 profile_url 字符串。
@@ -445,6 +601,14 @@ def main():
                     img_files.append(fname)
                 time.sleep(0.5)
 
+        # 推测带货品类 (基于标题+正文+话题标签的关键词匹配)
+        # 如实记录: 推测不出来就填"未识别"
+        note_desc = note.get("desc", "") or ""
+        note_title = note.get("title", "") or ""
+        # 从正文提取话题标签一起作为推测语料
+        tags_for_infer = " ".join(re.findall(r"#([^#\[\]]+)(?:\[话题\])?#?", note_desc))
+        product_category, category_evidence = infer_product_category(note_title, note_desc, tags_for_infer)
+
         notes_out.append({
             "note_id": note.get("noteId"),
             "xsec_token": m["feed"].get("xsecToken"),
@@ -461,6 +625,9 @@ def main():
                 "has_more": comments.get("hasMore", False),
                 "list": comments.get("list", []),
             },
+            # 推测字段: 基于内容关键词, 不是官方数据, 仅供运营参考
+            "product_category_inferred": product_category,
+            "product_category_evidence": category_evidence,
         })
 
     result = {
@@ -479,6 +646,20 @@ def main():
     log(f"   笔记: {len(notes_out)} 篇")
     log(f"   图片: {sum(len(n['image_files']) for n in notes_out)} 张")
     log(f"   评论: {sum(n['comments']['count'] for n in notes_out)} 条")
+    # 推测统计
+    identified = sum(1 for n in notes_out if n.get("product_category_inferred", "未识别") != "未识别")
+    log(f"   带货品类推测: {identified}/{len(notes_out)} 篇命中")
+    if identified > 0:
+        from collections import Counter
+        cats = Counter()
+        for n in notes_out:
+            c = n.get("product_category_inferred", "未识别")
+            if c != "未识别":
+                # 多品类拆开统计
+                for sub in c.split(","):
+                    cats[sub.strip()] += 1
+        for cat, cnt in cats.most_common():
+            log(f"     - {cat}: {cnt} 篇")
     log(f"   输出: {out_file}")
     log("=" * 60)
 

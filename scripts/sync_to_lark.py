@@ -232,6 +232,9 @@ def main():
             "分享数": safe_int(inter.get("sharedCount", 0)),
             "话题标签": tags_str,
             "笔记链接": f"[笔记](https://www.xiaohongshu.com/explore/{note_id})",
+            # 推测带货品类 (基于内容关键词, 非官方数据, 仅供运营参考)
+            # 字段 ID: fldxr0LEVZ (text)
+            "推测带货品类": note.get("product_category_inferred", "未识别"),
         }
 
         time.sleep(PACING_API_SEC)
