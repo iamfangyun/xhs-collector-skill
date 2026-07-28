@@ -1,5 +1,10 @@
 # xiaohongshu-mcp 工具参考
 
+> ⚠️ **已废弃（2026-07-28）**：v3 架构已弃用 xiaohongshu-mcp，改用 Playwright CDP 接管真实 Edge。
+> 本文件仅作为历史参考保留。当前采集逻辑见 `scripts/collect_v3.py` 和 `SKILL.md`。
+> 废弃原因：headless Chromium 指纹被小红书识别，触发登录墙；且 MCP 独立维护的 cookies.json
+> 容易与 Edge 网页端登录态失步，导致"cookie 在但服务端判游客"的故障。
+
 ## 工具位置
 - **二进制**：`C:\Users\Administrator\WorkBuddy\2026-07-24-22-52-09\xiaohongshu-mcp-windows-amd64.exe`
 - **登录工具**：`xiaohongshu-login-windows-amd64.exe`（同目录）
