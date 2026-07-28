@@ -35,6 +35,9 @@ from pathlib import Path
 
 # ============== 飞书配置 ==============
 LARK = r"C:\Users\Administrator\.workbuddy\binaries\node\cli-connector-packages\lark-cli.cmd"
+# Node.js 包装脚本，解决 Windows 下 Python subprocess 传中文参数的 GBK 编码问题
+NODE = r"C:\Users\Administrator\.workbuddy\binaries\node\versions\22.22.2\node.exe"
+LARK_RUN_JS = str(Path(__file__).parent / "lark_run.js")
 BASE_TOKEN = "KbmpbuXoiatEOcsnR5FcYtkJncL"
 TBL_ACCOUNT = "tbl9YZx9XsG1RoDN"
 TBL_NOTE = "tblsIghwrc2TqemX"
@@ -51,18 +54,78 @@ def log(msg):
 
 
 def run_lark(args, timeout=60):
-    cmd = [LARK] + args
+    # Windows: Python subprocess encodes argv as GBK, breaking Chinese.
+    # Solution: write --json payload to temp file, use Node.js wrapper
+    # (Node uses CreateProcessW wide-char API on Windows).
+    tmp_files = []
+    final_args = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--json" and i + 1 < len(args):
+            import uuid
+            tmp = Path("_tmp_lark_json") / f"payload_{uuid.uuid4().hex[:8]}.json"
+            tmp.parent.mkdir(exist_ok=True)
+            tmp.write_text(args[i+1], encoding="utf-8")
+            tmp_files.append(tmp)
+            final_args.append("--json")
+            final_args.append(f"@{tmp.absolute()}")
+            i += 2
+        else:
+            final_args.append(args[i])
+            i += 1
+
+    has_json = any(str(a).startswith("@") for a in final_args)
+
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+        if has_json:
+            # 用 Node.js 包装脚本：第一个参数是 json 文件路径，其余是完整 lark 参数（含 @file 占位符）
+            # lark_run.js 会读取 json 文件，替换 --json @file 为实际内容
+            cmd = [NODE, LARK_RUN_JS, str(tmp_files[0].absolute())] + final_args
+        else:
+            # 没有 --json 参数（如 record-search），参数都是 ASCII，直接用 lark-cli
+            cmd = [LARK] + final_args
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            return json.loads(r.stdout) if r.stdout else {"_raw": "", "_stderr": r.stderr}
+            out_bytes, err_bytes = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out_bytes, err_bytes = proc.communicate()
+
+        out = ""
+        for enc in ("utf-8", "gbk", "latin-1"):
+            try:
+                out = out_bytes.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        err = ""
+        for enc in ("utf-8", "gbk", "latin-1"):
+            try:
+                err = err_bytes.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+
+        try:
+            return json.loads(out) if out.strip() else {"_raw": "", "_stderr": err}
         except json.JSONDecodeError:
-            return {"_raw": r.stdout[:500], "_stderr": r.stderr[:500]}
-    except subprocess.TimeoutExpired:
-        return {"_error": "timeout", "_args": args}
+            return {"_raw": out[:500], "_stderr": err[:500]}
+    except Exception as e:
+        return {"_error": str(e), "_args": [str(a)[:50] for a in args]}
+    finally:
+        for tmp in tmp_files:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
 
 def parse_record_id(resp):
+    """从 upsert 响应解析 record_id。
+    - 创建: data.record.record_id_list[0] 或 data.record.record_id
+    - 更新: 响应里可能没有 record_id（只有 update 字段），此时返回 None（调用方应回退到 existing_xxx）
+    """
     if not resp.get("ok"):
         return None
     rec = resp.get("data", {}).get("record", {})
@@ -167,13 +230,21 @@ def main():
         "采集时间": now_str,
     }
     time.sleep(PACING_API_SEC)
-    r = run_lark([
+    upsert_cmd = [
         "base", "+record-upsert",
         "--base-token", BASE_TOKEN, "--table-id", TBL_ACCOUNT,
         "--json", json.dumps(account_fields, ensure_ascii=False),
         "--as", "user",
-    ])
+    ]
+    # 关键: record-upsert 不带 --record-id 时永远创建新记录（不会按业务键去重）
+    # 必须显式传 --record-id 才会更新已存在记录
+    if existing_aid:
+        upsert_cmd.extend(["--record-id", existing_aid])
+    r = run_lark(upsert_cmd)
     aid = parse_record_id(r)
+    if not aid and action == "update":
+        # 更新模式下响应可能不含 record_id，回退到 existing_aid
+        aid = existing_aid
     if not aid:
         log(f"❌ 账号 upsert 失败: {json.dumps(r, ensure_ascii=False)[:300]}")
         sys.exit(2)
@@ -226,10 +297,10 @@ def main():
             "发布时间": fmt_time(note.get("time_ms")),
             "采集时间": now_str,
             "笔记类型": "视频" if note.get("type") == "video" else "图文",
-            "点赞数": safe_int(inter.get("likedCount", 0)),
-            "收藏数": safe_int(inter.get("collectedCount", 0)),
-            "评论数": safe_int(inter.get("commentCount", 0)),
-            "分享数": safe_int(inter.get("sharedCount", 0)),
+            "点赞数": safe_int(inter.get("likedCount") or inter.get("liked_count") or 0),
+            "收藏数": safe_int(inter.get("collectedCount") or inter.get("collected_count") or 0),
+            "评论数": safe_int(inter.get("commentCount") or inter.get("comment_count") or 0),
+            "分享数": safe_int(inter.get("shareCount") or inter.get("sharedCount") or inter.get("share_count") or 0),
             "话题标签": tags_str,
             "笔记链接": f"[笔记](https://www.xiaohongshu.com/explore/{note_id})",
             # 推测带货品类 (基于内容关键词, 非官方数据, 仅供运营参考)
@@ -238,13 +309,18 @@ def main():
         }
 
         time.sleep(PACING_API_SEC)
-        r = run_lark([
+        upsert_cmd = [
             "base", "+record-upsert",
             "--base-token", BASE_TOKEN, "--table-id", TBL_NOTE,
             "--json", json.dumps(note_fields, ensure_ascii=False),
             "--as", "user",
-        ])
+        ]
+        if existing_nid:
+            upsert_cmd.extend(["--record-id", existing_nid])
+        r = run_lark(upsert_cmd)
         nid = parse_record_id(r)
+        if not nid and action_n == "update":
+            nid = existing_nid
         if not nid:
             log(f"    ❌ FAIL: {json.dumps(r, ensure_ascii=False)[:200]}")
             continue
@@ -276,32 +352,38 @@ def main():
                 existing_cid = find_record(TBL_COMMENT, "评论ID", cid) if cid else None
                 action_c = "update" if existing_cid else "create"
 
-                user_info = c.get("userInfo", {})
-                show_tags = c.get("showTags", [])
-                is_author = "is_author" in show_tags
+                # 兼容 camelCase（旧 MCP）和 snake_case（小红书 API 原始格式 / collect_v3）
+                user_info = c.get("userInfo") or c.get("user_info") or {}
+                show_tags = c.get("showTags") or c.get("show_tags") or []
+                is_author = "is_author" in show_tags or "is_author" in (show_tags if isinstance(show_tags, list) else [])
 
                 c_fields = {
                     "所属笔记": [{"id": nid}],
                     "评论ID": cid,
                     "内容": c.get("content", "") or "",
-                    "用户ID": user_info.get("userId", ""),
+                    "用户ID": user_info.get("userId") or user_info.get("user_id") or "",
                     "用户昵称": user_info.get("nickname", ""),
-                    "用户头像URL": user_info.get("avatar", "") or "",
-                    "IP属地": c.get("ipLocation", "") or "",
-                    "点赞数": safe_int(c.get("likeCount", 0)),
-                    "评论时间": fmt_time(c.get("createTime")),
+                    "用户头像URL": user_info.get("avatar") or user_info.get("image") or "",
+                    "IP属地": c.get("ipLocation") or c.get("ip_location") or "",
+                    "点赞数": safe_int(c.get("likeCount") or c.get("like_count") or 0),
+                    "评论时间": fmt_time(c.get("createTime") or c.get("create_time")),
                     "是否作者": is_author,
-                    "二级回复数": safe_int(c.get("subCommentCount", 0)),
+                    "二级回复数": safe_int(c.get("subCommentCount") or c.get("sub_comment_count") or 0),
                     "采集时间": now_str,
                 }
                 time.sleep(PACING_API_SEC)
-                r = run_lark([
+                upsert_cmd = [
                     "base", "+record-upsert",
                     "--base-token", BASE_TOKEN, "--table-id", TBL_COMMENT,
                     "--json", json.dumps(c_fields, ensure_ascii=False),
                     "--as", "user",
-                ])
+                ]
+                if existing_cid:
+                    upsert_cmd.extend(["--record-id", existing_cid])
+                r = run_lark(upsert_cmd)
                 rid = parse_record_id(r)
+                if not rid and action_c == "update":
+                    rid = existing_cid
                 status = "✅" if rid else "❌"
                 log(f"      {status} {cid[:16]}... ({action_c})")
 

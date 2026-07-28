@@ -47,8 +47,10 @@ MCP_URL = "http://localhost:18060/mcp"
 PACING_API_SEC = 1.5        # 任意两次 MCP API 调用间隔
 PACING_NOTE_SEC = 30.0      # 命中笔记之间间隔
 PACING_BATCH_SEC = 15.0     # 每拉取 10 篇详情小休一次
-RISK_KEYWORDS = ["风控", "异常", "blocked", "forbidden", "请稍后再试",
-                 "verify", "登录已过期", "login", "访问被拒绝"]
+RISK_KEYWORDS = ["风控", "blocked", "forbidden", "请稍后再试",
+                 "verify", "登录已过期", "访问被拒绝"]
+# 注意: 移除了 "异常"(太宽泛,正常返回里也含) 和 "login"(check_login_status 的返回 JSON 里就有这个字眼)
+# 真正的登录失效用 "登录已过期" 覆盖即可
 
 BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
